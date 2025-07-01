@@ -8,3 +8,6 @@ __pycache__
 *.pyz
 *.pywz
 *.pyzw
+*.mp3
+*.md
+samples_cache
