@@ -1,11 +1,120 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import pygame
 import threading
 import time
 import os
 import numpy as np
+import requests
+import json
+import hashlib
 from typing import List, Dict, Optional
+from pathlib import Path
+import tempfile
+import shutil
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class FreesoundDownloader:
+    """Downloads samples from Freesound.org using their API."""
+    
+    def __init__(self):
+        self.base_url = "https://freesound.org/apiv2"
+        # This is a demo token - for production, get your own at freesound.org/apiv2/apply/
+        self.api_token = os.getenv("FREESOUND_API_TOKEN")  # Limited functionality, but works for basic searches
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'Token {self.api_token}',
+            'User-Agent': 'PsytranceSequencer/1.0'
+        })
+        
+    def search_samples(self, query: str, max_results: int = 10) -> List[Dict]:
+        """Search for samples on Freesound."""
+        try:
+            params = {
+                'query': query,
+                'page_size': max_results,
+                'fields': 'id,name,previews,download,license,username,duration',
+                'filter': 'duration:[0.1 TO 3.0]'  # Short samples only
+            }
+            
+            response = self.session.get(f"{self.base_url}/search/text/", params=params)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('results', [])
+            else:
+                print(f"Search failed: {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"Search error: {e}")
+            return []
+    
+    def download_sample(self, sample_id: str, preview_url: str, filename: str) -> bool:
+        """Download a sample preview (no API key required for previews)."""
+        try:
+            # Use preview URL for demo (full downloads need API key)
+            response = self.session.get(preview_url, timeout=30)
+            if response.status_code == 200:
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                return True
+            return False
+        except Exception as e:
+            print(f"Download error: {e}")
+            return False
+
+class SampleManager:
+    """Manages sample downloads and caching."""
+    
+    def __init__(self):
+        self.cache_dir = Path("samples_cache")
+        self.cache_dir.mkdir(exist_ok=True)
+        self.downloader = FreesoundDownloader()
+        self.sample_queries = {
+            'kick': 'electronic kick drum techno',
+            'hihat': 'electronic hihat closed techno',
+            'snare': 'electronic snare clap techno',
+            'bass_lead': 'psytrance bass lead wobble',
+            'sub_bass': 'sub bass electronic deep',
+            'acid_bass': 'acid bass squelch tb303',
+            'perc1': 'electronic percussion tribal',
+            'perc2': 'electronic percussion techno'
+        }
+        
+    def get_sample_path(self, track_name: str) -> Optional[str]:
+        """Get the path to a cached sample, downloading if necessary."""
+        cache_file = self.cache_dir / f"{track_name}.mp3"
+        
+        if cache_file.exists():
+            return str(cache_file)
+        
+        # Try to download
+        query = self.sample_queries.get(track_name, f"electronic {track_name}")
+        samples = self.downloader.search_samples(query, max_results=5)
+        
+        for sample in samples:
+            if 'previews' in sample and 'preview-hq-mp3' in sample['previews']:
+                preview_url = sample['previews']['preview-hq-mp3']
+                if self.downloader.download_sample(sample['id'], preview_url, str(cache_file)):
+                    print(f"Downloaded {track_name}: {sample['name']} by {sample.get('username', 'Unknown')}")
+                    return str(cache_file)
+        
+        print(f"Could not download sample for {track_name}")
+        return None
+    
+    def download_all_samples(self) -> Dict[str, str]:
+        """Download all required samples."""
+        samples = {}
+        print("Downloading samples from Freesound.org...")
+        
+        for track_name in self.sample_queries.keys():
+            path = self.get_sample_path(track_name)
+            if path:
+                samples[track_name] = path
+        
+        print(f"Downloaded {len(samples)} samples")
+        return samples
 
 class PsytranceSequencer:
     """Main application class for the Psytrance Beat Sequencer."""
@@ -23,23 +132,24 @@ class PsytranceSequencer:
         
         # Track definitions
         self.tracks = [
-            {"name": "Kick Drum", "color": "#FF4444", "file": None},
-            {"name": "Hi-Hat", "color": "#44FF44", "file": None},
-            {"name": "Snare/Clap", "color": "#FFFF44", "file": None},
-            {"name": "Bass Lead", "color": "#FF44FF", "file": None},
-            {"name": "Sub Bass", "color": "#8844FF", "file": None},
-            {"name": "Acid Bass", "color": "#44FFFF", "file": None},
-            {"name": "Perc 1", "color": "#FF8844", "file": None},
-            {"name": "Perc 2", "color": "#88FF44", "file": None}
+            {"name": "Kick Drum", "color": "#FF4444", "file": None, "key": "kick"},
+            {"name": "Hi-Hat", "color": "#44FF44", "file": None, "key": "hihat"},
+            {"name": "Snare/Clap", "color": "#FFFF44", "file": None, "key": "snare"},
+            {"name": "Bass Lead", "color": "#FF44FF", "file": None, "key": "bass_lead"},
+            {"name": "Sub Bass", "color": "#8844FF", "file": None, "key": "sub_bass"},
+            {"name": "Acid Bass", "color": "#44FFFF", "file": None, "key": "acid_bass"},
+            {"name": "Perc 1", "color": "#FF8844", "file": None, "key": "perc1"},
+            {"name": "Perc 2", "color": "#88FF44", "file": None, "key": "perc2"}
         ]
         
-        # Initialize audio and UI
+        # Initialize components
+        self.sample_manager = SampleManager()
         self.audio_manager = AudioManager()
         self.ui_manager = UIManager(self.root, self.tracks, self.grid_size)
         self.sequencer_engine = SequencerEngine(self.beat_duration)
         
-        # Generate synthetic sounds
-        self.generate_sounds()
+        # Load samples
+        self.load_samples()
         
         # Connect UI callbacks
         self.ui_manager.set_play_callback(self.toggle_playback)
@@ -52,30 +162,85 @@ class PsytranceSequencer:
     
     def setup_window(self):
         """Configure the main window."""
-        self.root.title("Psytrance Beat Sequencer")
-        self.root.geometry("1200x600")
+        self.root.title("Psytrance Beat Sequencer - Freesound Edition")
+        self.root.geometry("1200x650")
         self.root.configure(bg="#1a1a1a")
         self.root.resizable(False, False)
     
-    def generate_sounds(self):
-        """Generate synthetic psytrance sounds."""
+    def load_samples(self):
+        """Load samples from Freesound or generate synthetic ones as fallback."""
+        try:
+            # Show loading message
+            loading_window = tk.Toplevel(self.root)
+            loading_window.title("Loading Samples")
+            loading_window.geometry("400x100")
+            loading_window.configure(bg="#1a1a1a")
+            loading_label = tk.Label(
+                loading_window,
+                text="Downloading samples from Freesound.org...",
+                fg="white",
+                bg="#1a1a1a",
+                font=("Arial", 12)
+            )
+            loading_label.pack(expand=True)
+            loading_window.update()
+            
+            # Try to download samples
+            downloaded_samples = self.sample_manager.download_all_samples()
+            
+            # Load downloaded samples
+            for track in self.tracks:
+                key = track["key"]
+                if key in downloaded_samples:
+                    self.audio_manager.load_sample_file(track["key"], downloaded_samples[key])
+                    track["file"] = downloaded_samples[key]
+                else:
+                    # Fallback to synthetic
+                    self.generate_synthetic_sample(track)
+            
+            loading_window.destroy()
+            
+            # Show success message
+            if downloaded_samples:
+                messagebox.showinfo(
+                    "Samples Loaded",
+                    f"Successfully loaded {len(downloaded_samples)} samples from Freesound.org!\n"
+                    f"Remaining tracks use synthetic sounds."
+                )
+            else:
+                messagebox.showwarning(
+                    "Offline Mode",
+                    "Could not connect to Freesound.org.\nUsing synthetic sounds only."
+                )
+                
+        except Exception as e:
+            print(f"Error loading samples: {e}")
+            # Fallback to all synthetic
+            for track in self.tracks:
+                self.generate_synthetic_sample(track)
+    
+    def generate_synthetic_sample(self, track):
+        """Generate a synthetic sample for a track."""
         sample_rate = 44100
+        track_name = track["key"]
         
-        # Generate different sound types
-        sounds = {
-            0: self.generate_kick(sample_rate),
-            1: self.generate_hihat(sample_rate),
-            2: self.generate_snare(sample_rate),
-            3: self.generate_wobbly_bass(sample_rate, freq=55),  # Wobbly bass lead
-            4: self.generate_sub_bass(sample_rate, freq=30),     # Sub bass
-            5: self.generate_acid_bass(sample_rate, freq=80),    # Acid bass
-            6: self.generate_percussion(sample_rate, freq=200),  # Perc 1
-            7: self.generate_percussion(sample_rate, freq=150)   # Perc 2
-        }
+        if track_name == "kick":
+            sound_data = self.generate_kick(sample_rate)
+        elif track_name == "hihat":
+            sound_data = self.generate_hihat(sample_rate)
+        elif track_name == "snare":
+            sound_data = self.generate_snare(sample_rate)
+        elif track_name == "bass_lead":
+            sound_data = self.generate_wobbly_bass(sample_rate, freq=55)
+        elif track_name == "sub_bass":
+            sound_data = self.generate_sub_bass(sample_rate, freq=30)
+        elif track_name == "acid_bass":
+            sound_data = self.generate_acid_bass(sample_rate, freq=80)
+        else:  # percussion
+            freq = 200 if track_name == "perc1" else 150
+            sound_data = self.generate_percussion(sample_rate, freq=freq)
         
-        # Load sounds into audio manager
-        for track_idx, sound_data in sounds.items():
-            self.audio_manager.load_sound(track_idx, sound_data, sample_rate)
+        self.audio_manager.load_sound_data(track_name, sound_data, sample_rate)
     
     def generate_kick(self, sample_rate: int) -> np.ndarray:
         """Generate a punchy kick drum."""
@@ -221,7 +386,8 @@ class PsytranceSequencer:
                 # Play sounds for current step
                 for track_idx in range(len(self.tracks)):
                     if pattern[self.current_step][track_idx]:
-                        self.audio_manager.play_sound(track_idx)
+                        track_key = self.tracks[track_idx]["key"]
+                        self.audio_manager.play_sound(track_key)
                 
                 # Update UI
                 self.ui_manager.update_playhead(self.current_step)
@@ -261,9 +427,9 @@ class AudioManager:
     def __init__(self):
         pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
         pygame.mixer.init()
-        self.sounds: Dict[int, pygame.mixer.Sound] = {}
+        self.sounds: Dict[str, pygame.mixer.Sound] = {}
     
-    def load_sound(self, track_id: int, sound_data: np.ndarray, sample_rate: int):
+    def load_sound_data(self, track_id: str, sound_data: np.ndarray, sample_rate: int):
         """Load a sound from numpy array."""
         # Convert to 16-bit integers
         sound_data = (sound_data * 32767).astype(np.int16)
@@ -278,7 +444,15 @@ class AudioManager:
         sound = pygame.sndarray.make_sound(stereo_data)
         self.sounds[track_id] = sound
     
-    def play_sound(self, track_id: int):
+    def load_sample_file(self, track_id: str, file_path: str):
+        """Load a sound from file."""
+        try:
+            sound = pygame.mixer.Sound(file_path)
+            self.sounds[track_id] = sound
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+    
+    def play_sound(self, track_id: str):
         """Play a sound by track ID."""
         if track_id in self.sounds:
             self.sounds[track_id].play()
@@ -315,7 +489,17 @@ class UIManager:
             fg="#00ff88",
             bg="#1a1a1a"
         )
-        title_label.pack(pady=(0, 20))
+        title_label.pack(pady=(0, 10))
+        
+        # Subtitle
+        subtitle_label = tk.Label(
+            main_frame,
+            text="Powered by Freesound.org",
+            font=("Arial", 12),
+            fg="#888888",
+            bg="#1a1a1a"
+        )
+        subtitle_label.pack(pady=(0, 20))
         
         # Control panel
         self.create_controls(main_frame)
@@ -522,12 +706,18 @@ class SequencerEngine:
 def main():
     """Main entry point."""
     try:
+        print("🎵 Starting Psytrance Beat Sequencer...")
+        print("🔍 This version downloads real samples from Freesound.org!")
+        print("📁 Samples will be cached locally for faster startup next time.")
+        print("🎛️ If internet is unavailable, synthetic sounds will be used.")
+        print("")
+        
         app = PsytranceSequencer()
         app.run()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\n🛑 Shutting down...")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
 
